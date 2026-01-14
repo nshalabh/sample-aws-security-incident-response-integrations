@@ -211,6 +211,7 @@ class AwsSecurityIncidentResponseServiceNowIntegrationStack(Stack):
             entry=path.join(path.dirname(__file__), "..", "assets/service_now_client"),
             runtime=aws_lambda.Runtime.PYTHON_3_13,
             timeout=Duration.minutes(15),
+            memory_size=1024,
             layers=[domain_layer, mappers_layer, wrappers_layer],
             environment={
                 "SERVICE_NOW_INSTANCE_ID": service_now_instance_id_ssm.parameter_name,
@@ -523,6 +524,8 @@ class AwsSecurityIncidentResponseServiceNowIntegrationStack(Stack):
                 path.dirname(__file__), "..", "assets/service_now_notifications_handler"
             ),
             runtime=aws_lambda.Runtime.PYTHON_3_13,
+            timeout=Duration.minutes(5),
+            memory_size=1024,
             layers=[domain_layer, mappers_layer, wrappers_layer],
             environment={
                 "EVENT_BUS_NAME": event_bus.event_bus_name,
@@ -760,6 +763,7 @@ class AwsSecurityIncidentResponseServiceNowIntegrationStack(Stack):
             layers=[domain_layer, mappers_layer, wrappers_layer],
             runtime=aws_lambda.Runtime.PYTHON_3_13,
             timeout=Duration.minutes(5),
+            memory_size=1024,
             environment={
                 "SERVICE_NOW_INSTANCE_ID": service_now_instance_id_ssm.parameter_name,
                 "SERVICE_NOW_CLIENT_ID": service_now_client_id_ssm.parameter_name,

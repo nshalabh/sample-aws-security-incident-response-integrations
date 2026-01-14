@@ -680,6 +680,8 @@ class ServiceNowApiService:
                 var outbound_rest_message_request_function_name_str = "{outbound_rest_message_request_function_name}";
                 var request = new sn_ws.RESTMessageV2(outbound_rest_message_name_str, outbound_rest_message_request_function_name_str);
                 request.setRequestBody(JSON.stringify(payload));
+                payloadStr = JSON.stringify(payload);
+                gs.info("Request details: " + payloadStr);
                 
                 var response = request.executeAsync();
                 gs.info('Security Incident event published to AWS Security Incident Response API Gateway: ' + event_type);

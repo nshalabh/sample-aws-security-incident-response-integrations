@@ -35,9 +35,6 @@ except ImportError:
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)  # Set to INFO first
 
-# Debug: Print all environment variables
-print(f"All environment variables: {dict(os.environ)}")
-
 # Get log level from environment variable
 log_level = os.environ.get("LOG_LEVEL", "error").lower()
 print(f"LOG_LEVEL environment variable: {log_level}")  # Debug print
@@ -55,7 +52,12 @@ print(f"Logger level set to: {logger.level}")  # Debug print
 security_incident_response_client = boto3.client("security-ir")
 dynamodb = boto3.resource("dynamodb")
 
-
+# Constants
+JWT_HEADER = {
+            'alg': 'RS256',  # Or RS256 if using certificate-based signing
+            'typ': 'JWT'
+            # 'kid': 'key_id_if_applicable' # If you have a specific key ID
+        }
 class ParameterService:
     """Class to handle parameter operations."""
 
@@ -187,7 +189,7 @@ class DatabaseService:
 class ServiceNowService:
     """Service for ServiceNow operations."""
 
-    def __init__(self, instance_id, **kwargs):
+    def __init__(self, instance_id, jwt_header, **kwargs):
         """
         Initialize the ServiceNow service.
 
@@ -200,7 +202,8 @@ class ServiceNowService:
                 - private_key_asset_bucket_param_name (str): SSM parameter name containing S3 bucket for private key asset
                 - private_key_asset_key_param_name (str): SSM parameter name containing S3 object key for private key asset
         """
-        self.service_now_client = ServiceNowClient(instance_id, **kwargs)
+        self.jwt_header = jwt_header
+        self.service_now_client = ServiceNowClient(instance_id, self.jwt_header, **kwargs)
 
     def get_incident(
         self, service_now_incident_id: str, integration_module: str = "itsm"
@@ -377,7 +380,7 @@ class ServiceNowService:
 class IncidentService:
     """Class to handle incident operations."""
 
-    def __init__(self, instance_id, table_name, **kwargs):
+    def __init__(self, instance_id, table_name, jwt_header, **kwargs):
         """Initialize the incident service.
 
         Args:
@@ -385,8 +388,9 @@ class IncidentService:
             table_name (str): Name of the DynamoDB table
             **kwargs: OAuth configuration parameters
         """
+        self.jwt_header = jwt_header
         self.db_service = DatabaseService(table_name)
-        self.service_now_service = ServiceNowService(instance_id, **kwargs)
+        self.service_now_service = ServiceNowService(instance_id, self.jwt_header, **kwargs)
 
     def extract_case_details(
         self, ir_case: Dict[str, Any]
@@ -843,6 +847,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             incident_service = IncidentService(
                 instance_id,
                 table_name,
+                jwt_header = JWT_HEADER,
                 client_id_param_name=client_id_param_name,
                 client_secret_param_name=client_secret_param_name,
                 user_id_param_name=user_id_param_name,

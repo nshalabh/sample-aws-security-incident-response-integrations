@@ -52,6 +52,11 @@ else:
 JIRA_EVENT_SOURCE = os.environ.get("JIRA_EVENT_SOURCE", "jira")
 SERVICE_NOW_EVENT_SOURCE = os.environ.get("SERVICE_NOW_EVENT_SOURCE", "service-now")
 UPDATE_TAG_TO_SKIP = "[AWS Security Incident Response Update]"
+JWT_HEADER = {
+            'alg': 'RS256',  # Or RS256 if using certificate-based signing
+            'typ': 'JWT'
+            # 'kid': 'key_id_if_applicable' # If you have a specific key ID
+        }
 
 # Initialize AWS clients
 security_ir_client = boto3.client("security-ir")
@@ -647,15 +652,15 @@ class DatabaseService:
 class ServiceNowService:
     """Class to handle ServiceNow operations for Security IR integration."""
 
-    def __init__(self, instance_id, **kwargs):
+    def __init__(self, instance_id, jwt_header, **kwargs):
         """Initialize the ServiceNow service.
 
         Args:
             instance_id (str): ServiceNow instance ID
             **kwargs: OAuth configuration parameters
         """
-
-        self.service_now_client = ServiceNowClient(instance_id, **kwargs)
+        self.jwt_header = jwt_header
+        self.service_now_client = ServiceNowClient(instance_id, self.jwt_header, **kwargs)
 
     def get_incident_attachment_data(
         self, incident_number: str, attachment_filename: str
@@ -975,6 +980,7 @@ class IncidentService:
 
                 service_now_service = ServiceNowService(
                     instance_id,
+                    jwt_header = JWT_HEADER,
                     client_id_param_name=client_id_param_name,
                     client_secret_param_name=client_secret_param_name,
                     user_id_param_name=user_id_param_name,

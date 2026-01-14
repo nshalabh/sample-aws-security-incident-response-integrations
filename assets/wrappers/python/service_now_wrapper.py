@@ -13,7 +13,7 @@ import requests
 import time
 import uuid
 from requests.auth import AuthBase
-from base64 import b64encode
+import gc
 
 # Configure logging
 logger = logging.getLogger()
@@ -25,11 +25,11 @@ ssm_client = boto3.client("ssm")
 # Static variables
 CONTENT_TYPE = 'application/x-www-form-urlencoded; charset=UTF-8'
 JWT_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:jwt-bearer'
-JWT_HEADER = {
-            'alg': 'RS256',  # Or RS256 if using certificate-based signing
-            'typ': 'JWT'
-            # 'kid': 'key_id_if_applicable' # If you have a specific key ID
-        }
+# JWT_HEADER = {
+#             'alg': 'RS256',  # Or RS256 if using certificate-based signing
+#             'typ': 'JWT'
+#             # 'kid': 'key_id_if_applicable' # If you have a specific key ID
+#         }
 ATTACHMENT_CONTENT_TYPE = 'application/octet-stream'
 
 class ServiceNowJWTAuth(AuthBase):
@@ -97,27 +97,39 @@ class ServiceNowJWTAuth(AuthBase):
 class ServiceNowClient:
     """Class to handle ServiceNow API interactions."""
 
-    def __init__(self, instance_id, **kwargs):
+    def __init__(self, instance_id, jwt_header, **kwargs):
         """
         Initialize the ServiceNow client with OAuth2 authentication.
 
         Args:
             instance_id (str): ServiceNow instance ID
-            **kwargs: OAuth configuration parameters including:
-                - client_id_param_name (str): SSM parameter name containing OAuth client ID
-                - client_secret_param_name (str): SSM parameter name containing OAuth client secret
-                - user_id_param_name (str): SSM parameter name containing ServiceNow user ID
-                - private_key_asset_bucket_param_name (str): SSM parameter name containing S3 bucket for private key asset
-                - private_key_asset_key_param_name (str): SSM parameter name containing S3 object key for private key asset
+            **kwargs: OAuth configuration parameters
         """
+        if not instance_id:
+            raise ValueError("No valid authentication method provided")
+            
         self.instance_id = instance_id
+        self.jwt_header = jwt_header
         self.client_id_param_name = kwargs.get('client_id_param_name')
         self.client_secret_param_name = kwargs.get('client_secret_param_name')
         self.user_id_param_name = kwargs.get('user_id_param_name')
         self.private_key_asset_bucket_param_name = kwargs.get('private_key_asset_bucket_param_name')
         self.private_key_asset_key_param_name = kwargs.get('private_key_asset_key_param_name')
-        self.s3_resource = boto3.resource('s3')
-        self.client = self.__create_client()
+        
+        # Validate required parameters are provided
+        required_params = [
+            self.client_id_param_name,
+            self.client_secret_param_name, 
+            self.user_id_param_name,
+            self.private_key_asset_bucket_param_name,
+            self.private_key_asset_key_param_name
+        ]
+        
+        if not all(required_params):
+            raise ValueError("No valid authentication method provided")
+        
+        self._s3_resource = None  # Lazy loading
+        self._client = None  # Lazy loading
 
     def __get_parameter(self, param_name: str) -> Optional[str]:
         """Fetch a parameter from SSM Parameter Store.
@@ -152,41 +164,46 @@ class ServiceNowClient:
             Optional[str]: Encoded JWT or None if generation fails
         """
         try:
-            # Get S3 bucket and key from parameters
             bucket = self.__get_parameter(self.private_key_asset_bucket_param_name)
             key = self.__get_parameter(self.private_key_asset_key_param_name)
             
-            if not bucket or not key:
-                logger.error("Missing S3 bucket or key for private key asset")
+            if not bucket or not key or not user_id or not client_id:
+                logger.error("Missing required parameters for JWT generation")
                 return None
             
-            # Read private key using S3 resource
-            s3_object = self.s3_resource.Object(bucket, key)
-            private_key = s3_object.get()['Body'].read().decode('utf-8')
+            # Read private key with minimal memory footprint
+            if not self._s3_resource:
+                self._s3_resource = boto3.resource('s3')
             
-            if not user_id or not client_id:
-                logger.error("Missing user ID or client ID for JWT")
-                return None
+            response = self._s3_resource.Object(bucket, key).get()
+            private_key = response['Body'].read().decode('utf-8')
+            response['Body'].close()
+            del response  # Explicit cleanup
             
-            # Create JWT payload
-            payload = {                
-                "iss": client_id,  # Issuer - OAuth client ID
-                "sub": user_id,    # Subject - ServiceNow user ID
-                "aud": client_id,  # Audience - OAuth client ID
-                "iat": int(time.time()),  # Issued at - current timestamp
-                "exp": int(time.time()) + 3600,  # Expiration - 1 hour from now
-                "jti": str(uuid.uuid4())  # JWT ID - unique identifier
+            # Create minimal JWT payload
+            payload = {
+                "iss": client_id,
+                "sub": user_id,
+                "aud": client_id,
+                "iat": int(time.time()),
+                "exp": int(time.time()) + 3600,
+                "jti": str(uuid.uuid4())
             }
             
             # Encode JWT
-            encoded_jwt = jwt.encode(payload, private_key, algorithm=JWT_HEADER["alg"], headers=JWT_HEADER)
+            encoded_jwt = jwt.encode(payload, private_key, algorithm=self.jwt_header["alg"], headers=self.jwt_header)
+            
+            # Clear sensitive data and force garbage collection
+            del private_key, payload
+            gc.collect()
+            
             return encoded_jwt
             
         except Exception as e:
             logger.error(f"Error generating JWT: {str(e)}")
             return None
         
-    def __get_jwt_oauth_access_token(self) -> Optional[str]:
+    def __get_jwt_oauth_access_token(self: Any) -> Optional[str]:
         """Get OAuth access token using JWT authentication.
 
         Returns:
@@ -226,6 +243,12 @@ class ServiceNowClient:
             logger.error("Invalid response format from OAuth endpoint")
             return None
         
+    def __get_client(self) -> Optional[SnowClient]:
+        """Get ServiceNow client with lazy loading."""
+        if self._client is None:
+            self._client = self.__create_client()
+        return self._client
+    
     def __create_client(self) -> Optional[SnowClient]:
         """Create a ServiceNow client instance with OAuth2 authentication.
 
@@ -239,7 +262,7 @@ class ServiceNowClient:
             
             instance_url = f"https://{self.instance_id}.service-now.com"
 
-            # OAuth2 authentication
+            # Get OAuth2 parameters
             client_id = self.__get_parameter(self.client_id_param_name)
             client_secret = self.__get_parameter(self.client_secret_param_name)
             user_id = self.__get_parameter(self.user_id_param_name)
@@ -248,12 +271,15 @@ class ServiceNowClient:
                 logger.error("Missing OAuth2 credentials")
                 return None
             
-            # Preparing JWT token
+            # Generate JWT token
             encoded_jwt = self.__get_encoded_jwt(client_id, user_id)
             
-            # Preparing ServiceNowJWTAuth for ServiceNowClient
-            auth = ServiceNowJWTAuth(self.instance_id, client_id, client_secret, encoded_jwt)
+            if not encoded_jwt:
+                logger.error("Failed to generate JWT token")
+                return None
             
+            # Create ServiceNow client
+            auth = ServiceNowJWTAuth(self.instance_id, client_id, client_secret, encoded_jwt)
             return SnowClient(instance_url, auth)
 
         except Exception as e:
@@ -269,17 +295,11 @@ class ServiceNowClient:
         Returns:
             Optional[GlideRecord]: GlideRecord instance or None if retrieval fails
         """
-        """Prepare a Glide Record using ServiceNowClient for querying.
-
-        Args:
-            record_type (str): Type of ServiceNow record (e.g., 'incident')
-
-        Returns:
-            Optional[GlideRecord]: GlideRecord instance or None if retrieval fails
-        """
         try:
-            glide_record = self.client.GlideRecord(record_type)
-            return glide_record
+            client = self.__get_client()
+            if not client:
+                return None
+            return client.GlideRecord(record_type)
         except Exception as e:
             logger.error(f"Error preparing GlideRecord: {str(e)}")
             return None
@@ -338,35 +358,34 @@ class ServiceNowClient:
             Optional[Dict[str, Any]]: Incident record dictionary or None if retrieval fails
         """
         try:
-            if integration_module == "itsm":
-                table_name = "incident"
-            elif integration_module == "ir":
-                table_name = "sn_si_incident"
-            else:
+            # Force garbage collection before API call
+            gc.collect()
+            
+            table_name = "incident" if integration_module == "itsm" else "sn_si_incident" if integration_module == "ir" else None
+            if not table_name:
                 logger.error(f"Invalid integration module: {integration_module}")
                 return None
 
             glide_record = self.__get_glide_record(table_name)
+            if not glide_record:
+                return None
+                
             glide_record.add_query("number", incident_number)
             glide_record.query()
+            
             if glide_record.next():
-                logger.info(
-                    f"Incident details for {incident_number} from ServiceNow {table_name}: {glide_record}"
-                )
-                logger.info(
-                    f"Getting DisplayValue for the Incident {incident_number} GlideRecord from ServiceNow"
-                )
-                glide_record_with_display_values = glide_record.serialize(
-                    display_value=True
-                )
-                logger.info(
-                    f"Display values for incident details for {incident_number} from ServiceNow {table_name}: {glide_record_with_display_values}"
-                )
-                return glide_record_with_display_values
+                # Serialize with memory management
+                result = glide_record.serialize(display_value=True)
+                del glide_record  # Clean up immediately
+                gc.collect()
+                return result
+            else:
+                del glide_record
+                return None
+                
         except Exception as e:
-            logger.error(
-                f"Error getting incident details for {incident_number} from ServiceNow: {str(e)}"
-            )
+            logger.error(f"Error getting incident details for {incident_number} from ServiceNow: {str(e)}")
+            gc.collect()
             return None
 
     def get_incident(
@@ -417,39 +436,44 @@ class ServiceNowClient:
             Optional[List[Dict[str, str]]]: List of attachment details dictionaries or None if retrieval fails
         """
         try:
-            if integration_module == "itsm":
-                table_name = "incident"
-            elif integration_module == "ir":
-                table_name = "sn_si_incident"
-            else:
+            # Force garbage collection before API call
+            gc.collect()
+            
+            table_name = "incident" if integration_module == "itsm" else "sn_si_incident" if integration_module == "ir" else None
+            if not table_name:
                 logger.error(f"Invalid integration module: {integration_module}")
                 return None
 
             glide_record = self.__get_glide_record(table_name)
+            if not glide_record:
+                return None
+                
             glide_record.add_query("number", service_now_incident_id)
             glide_record.query()
+            
             if glide_record.next():
                 attachments_list = []
                 attachments = glide_record.get_attachments()
+                
+                # Process attachments with memory management
                 for attachment in attachments:
                     attachment_details = {
                         "filename": attachment.file_name,
                         "content_type": attachment.content_type,
                     }
-                    logger.info(
-                        f"Incident attachment details for incident {glide_record.number}: {attachment_details}"
-                    )
                     attachments_list.append(attachment_details)
+                
+                # Clean up immediately
+                del glide_record, attachments
+                gc.collect()
                 return attachments_list
             else:
-                logger.error(
-                    f"Incident {service_now_incident_id} not found in {table_name}"
-                )
+                del glide_record
                 return None
+                
         except Exception as e:
-            logger.error(
-                f"Error getting attachments for incident {service_now_incident_id} from ServiceNow: {str(e)}"
-            )
+            logger.error(f"Error getting attachments for incident {service_now_incident_id} from ServiceNow: {str(e)}")
+            gc.collect()
             return None
 
     def get_incident_attachment_data(
@@ -722,54 +746,30 @@ class ServiceNowClient:
             Dict[str, Any]: Dictionary with serializable ServiceNow incident details
         """
         try:
+            # Extract only essential fields to minimize memory usage
             incident_dict = {
                 "sys_id": service_now_incident.get("sys_id"),
                 "number": service_now_incident.get("number"),
                 "short_description": service_now_incident.get("short_description"),
                 "description": service_now_incident.get("description"),
-                "sys_created_on": service_now_incident.get("sys_created_on"),
-                "sys_created_by": service_now_incident.get("sys_created_by"),
-                "resolved_by": service_now_incident.get("resolved_by"),
-                "resolved_at": service_now_incident.get("resolved_at"),
-                "opened_at": service_now_incident.get("opened_at"),
-                "closed_at": service_now_incident.get("closed_at"),
                 "state": service_now_incident.get("state"),
-                "impact": service_now_incident.get("impact"),
-                "active": service_now_incident.get("active"),
                 "priority": service_now_incident.get("priority"),
-                "caller_id": service_now_incident.get("caller_id"),
                 "urgency": service_now_incident.get("urgency"),
                 "severity": service_now_incident.get("severity"),
-                "comments": service_now_incident.get("comments"),
-                "work_notes": service_now_incident.get("work_notes"),
-                "comments_and_work_notes": service_now_incident.get(
-                    "comments_and_work_notes"
-                ),
-                "close_code": service_now_incident.get("close_code"),
-                "close_notes": service_now_incident.get("close_notes"),
-                "closed_by": service_now_incident.get("closed_by"),
-                "reopened_by": service_now_incident.get("reopened_by"),
-                "assigned_to": service_now_incident.get("assigned_to"),
-                "due_date": service_now_incident.get("due_date"),
-                "sys_tags": service_now_incident.get("sys_tags"),
-                "category": service_now_incident.get("category"),
-                "subcategory": service_now_incident.get("subcategory"),
-                "attachments": service_now_incident_attachments,
+                "sys_created_on": service_now_incident.get("sys_created_on"),
+                "sys_created_by": service_now_incident.get("sys_created_by"),
+                "attachments": service_now_incident_attachments or [],
             }
+            
+            # Clean up input parameters immediately
+            del service_now_incident, service_now_incident_attachments
+            gc.collect()
+            
             return incident_dict
         except Exception as e:
             logger.error(f"Error extracting ServiceNow incident details: {str(e)}")
-            # Return minimal details if extraction fails
+            gc.collect()
             return {
-                "id": (
-                    service_now_incident.id
-                    if hasattr(service_now_incident, "id")
-                    else None
-                ),
-                "key": (
-                    service_now_incident.key
-                    if hasattr(service_now_incident, "key")
-                    else None
-                ),
                 "error": str(e),
+                "number": service_now_incident.get("number") if service_now_incident else None
             }

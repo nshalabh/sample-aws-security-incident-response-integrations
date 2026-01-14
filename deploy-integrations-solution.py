@@ -79,12 +79,19 @@ def deploy_servicenow(args):
         # Create S3 client and upload private key
         s3_client = boto3.client('s3')
         account = boto3.client('sts').get_caller_identity()['Account']
+        region = boto3.Session().region_name or 'us-east-1'
         bucket_name = f"snow-key-{account}"
         
         try:
-            s3_client.create_bucket(Bucket=bucket_name)
+            if region == 'us-east-1':
+                s3_client.create_bucket(Bucket=bucket_name)
+            else:
+                s3_client.create_bucket(
+                    Bucket=bucket_name,
+                    CreateBucketConfiguration={'LocationConstraint': region}
+                )
             print(f"\n📦 Created S3 bucket: {bucket_name}")
-        except s3_client.exceptions.BucketAlreadyOwnedByYou:
+        except (s3_client.exceptions.BucketAlreadyOwnedByYou, s3_client.exceptions.BucketAlreadyExists):
             print(f"\n📦 Using existing S3 bucket: {bucket_name}")
         except Exception as e:
             print(f"\n❌ Error creating S3 bucket: {e}")

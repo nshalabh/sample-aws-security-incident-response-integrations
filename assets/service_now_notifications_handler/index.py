@@ -7,13 +7,12 @@ import json
 import os
 import datetime
 import time
-import traceback
 import logging
 from typing import Dict, Any, Optional, List
 import boto3
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
-from aws_lambda_powertools.utilities.typing import LambdaContext
+import gc
 
 try:
     # This import works for lambda function and imports the lambda layer at runtime
@@ -24,6 +23,11 @@ except ImportError:
 
 # Constants
 EVENT_SOURCE = os.environ.get("EVENT_SOURCE", "service-now")
+JWT_HEADER = {
+            "typ": "JWT",
+            "alg": "RS256"  # Or RS256 if using certificate-based signing
+            # 'kid': 'key_id_if_applicable' # If you have a specific key ID
+        }
 
 # Configure logging
 logger = logging.getLogger()
@@ -42,10 +46,21 @@ else:
 
 print(f"Logger level set to: {logger.level}")  # Debug print
 
-# Initialize AWS clients
-events_client = boto3.client("events")
-dynamodb = boto3.resource("dynamodb")
+# Lazy-loaded AWS clients
+_events_client = None
+_dynamodb = None
 
+def get_events_client():
+    global _events_client
+    if _events_client is None:
+        _events_client = boto3.client("events")
+    return _events_client
+
+def get_dynamodb():
+    global _dynamodb
+    if _dynamodb is None:
+        _dynamodb = boto3.resource("dynamodb")
+    return _dynamodb
 
 class DateTimeEncoder(json.JSONEncoder):
     """Custom JSON encoder for datetime objects."""
@@ -278,7 +293,10 @@ class EventPublisherService:
         logger.debug(
             f"Initializing EventPublisherService with event bus: {event_bus_name}"
         )
-        self.events_client = events_client
+        logger.info(
+            f"Initializing EventPublisherService with event bus: {event_bus_name}"
+        )
+        self.events_client = get_events_client()
         self.event_bus_name = event_bus_name
 
     def _publish_event(self, event: BaseEvent) -> Dict[str, Any]:
@@ -295,8 +313,9 @@ class EventPublisherService:
         event_dict = event.to_dict()
 
         try:
-            # Convert the dictionary to a JSON string
+            # Convert to JSON with memory cleanup
             event_json = json.dumps(event_dict, cls=DateTimeEncoder)
+            del event_dict  # Free memory
 
             response = self.events_client.put_events(
                 Entries=[
@@ -322,7 +341,7 @@ class DatabaseService:
 
     def __init__(self, table_name):
         """Initialize the database service"""
-        self.table = dynamodb.Table(table_name)
+        self.table = get_dynamodb().Table(table_name)
 
     def __should_retry(self, attempt: int, max_retries: int, wait_time: int) -> bool:
         """
@@ -527,14 +546,16 @@ class DatabaseService:
 class ServiceNowService:
     """Service for ServiceNow operations."""
 
-    def __init__(self, instance_id, **kwargs):
+    def __init__(self, instance_id, jwt_header, **kwargs):
         """Initialize the ServiceNow service
         
         Args:
             instance_id (str): ServiceNow instance ID
             **kwargs: OAuth configuration parameters
         """
-        self.service_now_client = ServiceNowClient(instance_id, **kwargs)
+        logger.info(f"Initializing ServiceNowClient: {instance_id}")
+        self.jwt_header = jwt_header
+        self.service_now_client = ServiceNowClient(instance_id, self.jwt_header, **kwargs)
 
     def _get_incident_details(
         self, service_now_incident_id: str
@@ -549,36 +570,48 @@ class ServiceNowService:
             Dictionary of incident details or None if retrieval fails
         """
         try:
+            # Force garbage collection before heavy API operations
+            gc.collect()
+            
             integration_module = os.environ.get("INTEGRATION_MODULE", "itsm")
-            service_now_incident = (
-                self.service_now_client.get_incident_with_display_values(
-                    service_now_incident_id, integration_module
-                )
+            
+            # Get incident with memory cleanup
+            service_now_incident = self.service_now_client.get_incident_with_display_values(
+                service_now_incident_id, integration_module
             )
-            service_now_incident_attachments = (
-                self.service_now_client.get_incident_attachments_details(
-                    service_now_incident_id, integration_module
-                )
-            )
+            
             if not service_now_incident:
-                logger.error(
-                    f"Failed to get incident {service_now_incident_id} from ServiceNow"
-                )
+                logger.error(f"Failed to get incident {service_now_incident_id} from ServiceNow")
                 return None
-
-            return self.service_now_client.extract_incident_details(
+            
+            # Get attachments with memory cleanup
+            service_now_incident_attachments = self.service_now_client.get_incident_attachments_details(
+                service_now_incident_id, integration_module
+            )
+            
+            # Extract details and clean up immediately
+            result = self.service_now_client.extract_incident_details(
                 service_now_incident, service_now_incident_attachments
             )
+            
+            # Clean up large objects
+            del service_now_incident
+            if service_now_incident_attachments:
+                del service_now_incident_attachments
+            gc.collect()
+            
+            return result
 
         except Exception as e:
             logger.error(f"Error getting incident details from ServiceNow: {str(e)}")
+            gc.collect()  # Clean up on error
             return None
 
 
 class ServiceNowMessageProcessorService:
     """Class to handle ServiceNow message processing."""
 
-    def __init__(self, instance_id, table_name, event_bus_name, **kwargs):
+    def __init__(self, instance_id, table_name, event_bus_name, jwt_header, **kwargs):
         """Initialize the message processor
         
         Args:
@@ -587,9 +620,17 @@ class ServiceNowMessageProcessorService:
             event_bus_name (str): EventBridge event bus name
             **kwargs: OAuth configuration parameters
         """
-        self.db_service = DatabaseService(table_name)
-        self.service_now_service = ServiceNowService(instance_id, **kwargs)
-        self.event_publisher_service = EventPublisherService(event_bus_name)
+        logger.info("Initializing ServiceNowMessageProcessorService")
+        
+        try:
+            self.db_service = DatabaseService(table_name)
+            self.jwt_header = jwt_header
+            self.service_now_service = ServiceNowService(instance_id, self.jwt_header, **kwargs)
+            self.event_publisher_service = EventPublisherService(event_bus_name)
+            logger.info("ServiceNowMessageProcessorService initialization completed")
+        except Exception as e:
+            logger.error(f"Failed to initialize ServiceNowMessageProcessorService: {str(e)}")
+            raise
 
     def _extract_event_body(self, event):
         """
@@ -631,7 +672,7 @@ class ServiceNowMessageProcessorService:
             return body
         except Exception as e:
             logger.error(f"Failed to extract event body: {str(e)}")
-            logger.error(traceback.format_exc())
+            # logger.error(traceback.format_exc())
             return "{}"
 
     def _parse_message(self, message: str) -> Dict[str, Any]:
@@ -681,7 +722,7 @@ class ServiceNowMessageProcessorService:
             return {}
         except Exception as e:
             logger.error(f"Error parsing message: {str(e)}")
-            logger.error(traceback.format_exc())
+            # logger.error(traceback.format_exc())  # noqa: F821
             return {}
 
     def _process_webhook_payload(self, payload: Dict[str, Any]) -> bool:
@@ -768,32 +809,51 @@ class ServiceNowMessageProcessorService:
         Returns:
             True if processing was successful, False otherwise
         """
-        # Get ServiceNow incident details
-        service_now_incident_details = self.service_now_service._get_incident_details(
-            incident_number
-        )
-        if not service_now_incident_details:
-            logger.error(
-                f"Failed to get incident details for {incident_number} from ServiceNow"
+        try:
+            # Force garbage collection before heavy operations
+            gc.collect()
+            
+            logger.info("Get incident details from SNOW")
+            # Get ServiceNow incident details
+            service_now_incident_details = self.service_now_service._get_incident_details(
+                incident_number
             )
+            if not service_now_incident_details:
+                logger.error(
+                    f"Failed to get incident details for {incident_number} from ServiceNow"
+                )
+                return False
+
+            logger.info("Get incident details from DDB")
+            # Get existing incident details from database
+            service_now_incident_details_ddb = self.db_service._get_incident_details(
+                incident_number
+            )
+
+            # Process based on whether the incident exists in the database
+            if not service_now_incident_details_ddb:
+                result = self.__handle_new_incident(
+                    incident_number, service_now_incident_details
+                )
+            else:
+                result = self.__handle_existing_incident(
+                    incident_number,
+                    service_now_incident_details,
+                    service_now_incident_details_ddb,
+                )
+            
+            # Clean up large objects
+            del service_now_incident_details
+            if service_now_incident_details_ddb:
+                del service_now_incident_details_ddb
+            gc.collect()
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing incident {incident_number}: {str(e)}")
+            gc.collect()  # Clean up on error
             return False
-
-        # Get existing incident details from database
-        service_now_incident_details_ddb = self.db_service._get_incident_details(
-            incident_number
-        )
-
-        # Process based on whether the incident exists in the database
-        if not service_now_incident_details_ddb:
-            return self.__handle_new_incident(
-                incident_number, service_now_incident_details
-            )
-        else:
-            return self.__handle_existing_incident(
-                incident_number,
-                service_now_incident_details,
-                service_now_incident_details_ddb,
-            )
 
     def __handle_new_incident(
         self, incident_number: str, incident_details: Dict[str, Any]
@@ -812,11 +872,13 @@ class ServiceNowMessageProcessorService:
             logger.info(
                 f"Publishing IncidentCreatedEvent for ServiceNow incident {incident_number}"
             )
-            self.db_service._add_incident_details(incident_number, incident_details)
-            self.event_publisher_service._publish_event(
-                IncidentCreatedEvent(incident_details)
-            )
-            return True
+            # Process operations separately to manage memory
+            db_success = self.db_service._add_incident_details(incident_number, incident_details)
+            if db_success:
+                event = IncidentCreatedEvent(incident_details)
+                self.event_publisher_service._publish_event(event)
+                del event  # Clean up event object
+            return db_success
         except Exception as e:
             logger.error(f"Error handling new incident {incident_number}: {str(e)}")
             return False
@@ -839,24 +901,27 @@ class ServiceNowMessageProcessorService:
             True if processing was successful, False otherwise
         """
         try:
-            # Compare incident details to detect changes
-            logger.info(f"Latest Incident details from ServiceNow {incident_details}")
-            logger.info(
-                f"Existing Incident details from DDB {json.loads(existing_details)}"
-            )
-            if incident_details != json.loads(existing_details):
+            # Compare incident details to detect changes (memory efficient)
+            existing_dict = json.loads(existing_details)
+            has_changes = incident_details != existing_dict
+            del existing_dict, existing_details  # Free memory immediately
+            
+            if has_changes:
                 logger.info(
                     f"Publishing IncidentUpdatedEvent for ServiceNow incident {incident_number}"
                 )
-                self.db_service._update_incident_details(
+                # Process operations separately to manage memory
+                db_success = self.db_service._update_incident_details(
                     incident_number, incident_details
                 )
-                self.event_publisher_service._publish_event(
-                    IncidentUpdatedEvent(incident_details)
-                )
+                if db_success:
+                    event = IncidentUpdatedEvent(incident_details)
+                    self.event_publisher_service._publish_event(event)
+                    del event  # Clean up event object
+                return db_success
             else:
                 logger.info(f"No changes detected for incident {incident_number}")
-            return True
+                return True
         except Exception as e:
             logger.error(
                 f"Error handling existing incident {incident_number}: {str(e)}"
@@ -913,7 +978,7 @@ class ResponseBuilderService:
 
 
 # @logger.inject_lambda_context
-def handler(event: Dict[str, Any], context: LambdaContext) -> Dict[str, Any]:
+def handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
     Lambda handler for processing API Gateway webhook events from ServiceNow
 
@@ -925,7 +990,9 @@ def handler(event: Dict[str, Any], context: LambdaContext) -> Dict[str, Any]:
         API Gateway compatible response
     """
     try:
-        # Log incoming event with more details for debugging
+        # Force initial garbage collection
+        gc.collect()
+        
         logger.info("Received event from Service Now")
 
         # Handle OPTIONS request for CORS
@@ -949,9 +1016,7 @@ def handler(event: Dict[str, Any], context: LambdaContext) -> Dict[str, Any]:
         try:
             table_name = os.environ["INCIDENTS_TABLE_NAME"]
             event_bus_name = os.environ.get("EVENT_BUS_NAME", "default")
-            logger.info(f"Using table: {table_name}, event bus: {event_bus_name}")
         except KeyError as e:
-            logger.error(f"Missing required environment variable: {str(e)}")
             return ResponseBuilderService._build_error_response(
                 f"Configuration error: Missing {str(e)}"
             )
@@ -966,14 +1031,10 @@ def handler(event: Dict[str, Any], context: LambdaContext) -> Dict[str, Any]:
             private_key_asset_bucket_param_name = os.environ.get("PRIVATE_KEY_ASSET_BUCKET")
             private_key_asset_key_param_name = os.environ.get("PRIVATE_KEY_ASSET_KEY")
 
-            logger.info(
-                f"Getting parameters: {instance_id_param}, {client_id_param_name}, {client_secret_param_name}, {user_id_param_name}, {private_key_asset_bucket_param_name}, {private_key_asset_key_param_name}"
-            )
-
             instance_id = parameter_service._get_parameter(instance_id_param)
+            del parameter_service  # Clean up immediately
 
             if not all([instance_id, client_id_param_name, client_secret_param_name, user_id_param_name, private_key_asset_bucket_param_name, private_key_asset_key_param_name]):
-                logger.error("Failed to retrieve ServiceNow credentials from SSM")
                 return ResponseBuilderService._build_error_response(
                     "Failed to retrieve ServiceNow credentials"
                 )
@@ -983,57 +1044,75 @@ def handler(event: Dict[str, Any], context: LambdaContext) -> Dict[str, Any]:
                 f"Parameter retrieval error: {str(e)}"
             )
 
-        # Create processor
-        processor = ServiceNowMessageProcessorService(
-            instance_id,
-            table_name,
-            event_bus_name,
-            client_id_param_name=client_id_param_name,
-            client_secret_param_name=client_secret_param_name,
-            user_id_param_name=user_id_param_name,
-            private_key_asset_bucket_param_name=private_key_asset_bucket_param_name,
-            private_key_asset_key_param_name=private_key_asset_key_param_name
-        )
-        processed_count = 0
-
-        # Extract the request body from API Gateway event
-        body = processor._extract_event_body(event)
-        if body is None or body == "{}":
-            logger.error("Empty or invalid request body")
-            return ResponseBuilderService._build_error_response(
-                "Empty or invalid request body"
+        processor = None
+        try:
+            # Create processor with memory management
+            gc.collect()  # Clean before heavy operation
+            processor = ServiceNowMessageProcessorService(
+                instance_id,
+                table_name,
+                event_bus_name,
+                jwt_header=JWT_HEADER,
+                client_id_param_name=client_id_param_name,
+                client_secret_param_name=client_secret_param_name,
+                user_id_param_name=user_id_param_name,
+                private_key_asset_bucket_param_name=private_key_asset_bucket_param_name,
+                private_key_asset_key_param_name=private_key_asset_key_param_name
             )
-
-        # Parse the request body
-        payload = processor._parse_message(body)
-        logger.info("Parsed event payload")
-
-        # Check if payload has required fields
-        if not payload or "incident_number" not in payload:
-            logger.error("Missing required fields in payload")
+        except Exception as e:
+            logger.error(f"Failed to create ServiceNowMessageProcessorService: {str(e)}")
             return ResponseBuilderService._build_error_response(
-                "Missing required fields in payload"
+                f"Failed to initialize processor: {str(e)}"
             )
+        
+        try:
+            # Extract and process with memory cleanup
+            body = processor._extract_event_body(event)
+            del event  # Free event memory
+            
+            if body is None or body == "{}":
+                return ResponseBuilderService._build_error_response(
+                    "Empty or invalid request body"
+                )
 
-        # Process the webhook payload
-        success = processor._process_webhook_payload(payload)
+            payload = processor._parse_message(body)
+            del body  # Free body memory
+            
+            if not payload or "incident_number" not in payload:
+                return ResponseBuilderService._build_error_response(
+                    "Missing required fields in payload"
+                )
 
-        if not success:
-            logger.error("Failed to process ServiceNow webhook payload")
+            # Process with memory management
+            gc.collect()
+            success = processor._process_webhook_payload(payload)
+            del payload  # Free payload memory
+            
+            if not success:
+                return ResponseBuilderService._build_error_response(
+                    "Failed to process ServiceNow webhook payload"
+                )
+
+            return ResponseBuilderService._build_success_response(
+                "Successfully processed 1 record"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error during event processing: {str(e)}")
             return ResponseBuilderService._build_error_response(
-                "Failed to process ServiceNow webhook payload"
+                f"Event processing error: {str(e)}"
             )
-
-        processed_count += 1
-        logger.info(f"Successfully processed {processed_count} records")
-
-        return ResponseBuilderService._build_success_response(
-            f"Successfully processed {processed_count} records"
-        )
+        finally:
+            # Clean up processor
+            if processor:
+                del processor
+            gc.collect()
 
     except Exception as e:
         logger.error(f"Error in Lambda handler: {str(e)}")
-        logger.error(traceback.format_exc())
         return ResponseBuilderService._build_error_response(
             f"Internal server error: {str(e)}"
         )
+    finally:
+        # Final cleanup
+        gc.collect()
