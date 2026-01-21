@@ -18,6 +18,30 @@ import boto3
 import os
 
 
+def configure_s3_bucket_security(s3_client, bucket_name):
+    """Configure S3 bucket with encryption and versioning.
+    
+    Args:
+        s3_client: Boto3 S3 client
+        bucket_name (str): Name of the S3 bucket
+    """
+    s3_client.put_bucket_encryption(
+        Bucket=bucket_name,
+        ServerSideEncryptionConfiguration={
+            'Rules': [{
+                'ApplyServerSideEncryptionByDefault': {
+                    'SSEAlgorithm': 'aws:kms',
+                    'KMSMasterKeyID': 'alias/aws/s3'
+                }
+            }]
+        }
+    )
+    s3_client.put_bucket_versioning(
+        Bucket=bucket_name,
+        VersioningConfiguration={'Status': 'Enabled'}
+    )
+
+
 def deploy_jira(args):
     """Deploy Jira integration using CDK.
 
@@ -90,9 +114,18 @@ def deploy_servicenow(args):
                     Bucket=bucket_name,
                     CreateBucketConfiguration={'LocationConstraint': region}
                 )
-            print(f"\n📦 Created S3 bucket: {bucket_name}")
+            
+            # Enable encryption and versioning
+            configure_s3_bucket_security(s3_client, bucket_name)
+            print(f"\n📦 Created encrypted S3 bucket: {bucket_name}")
         except (s3_client.exceptions.BucketAlreadyOwnedByYou, s3_client.exceptions.BucketAlreadyExists):
-            print(f"\n📦 Using existing S3 bucket: {bucket_name}")
+            # Apply encryption to existing bucket
+            try:
+                configure_s3_bucket_security(s3_client, bucket_name)
+            except Exception:
+                print(f"\n📦 Encryption already enabled for S3 bucket: {bucket_name}")
+                pass
+            print(f"\n📦 Using existing encrypted S3 bucket: {bucket_name}")
         except Exception as e:
             print(f"\n❌ Error creating S3 bucket: {e}")
             return 1

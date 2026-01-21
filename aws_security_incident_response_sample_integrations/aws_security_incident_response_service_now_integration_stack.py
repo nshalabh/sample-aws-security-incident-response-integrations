@@ -143,7 +143,15 @@ class AwsSecurityIncidentResponseServiceNowIntegrationStack(Stack):
         service_now_user_id_ssm.apply_removal_policy(RemovalPolicy.DESTROY)
 
         # Use existing S3 bucket from deploy script
-        from aws_cdk import aws_s3 as s3
+        from aws_cdk import aws_s3 as s3, aws_kms as kms
+        
+        # Reference the AWS-managed S3 KMS key
+        s3_kms_key = kms.Alias.from_alias_name(
+            self,
+            "AWSS3ManagedKey",
+            "alias/aws/s3"
+        )
+        
         private_key_bucket = s3.Bucket.from_bucket_name(
             self,
             "ServiceNowPrivateKeyBucket",
@@ -266,6 +274,9 @@ class AwsSecurityIncidentResponseServiceNowIntegrationStack(Stack):
 
         # Grant S3 permissions to read private key
         private_key_bucket.grant_read(service_now_client_role)
+        
+        # Grant KMS permissions to decrypt S3 objects using specific key
+        s3_kms_key.grant_decrypt(service_now_client_role)
 
         # Grant specific DynamoDB permissions instead of full access
         table.grant_read_write_data(service_now_client_role)
@@ -560,6 +571,9 @@ class AwsSecurityIncidentResponseServiceNowIntegrationStack(Stack):
 
         # Grant S3 permissions to read private key
         private_key_bucket.grant_read(service_now_notifications_handler_role)
+        
+        # Grant KMS permissions to decrypt S3 objects using specific key
+        s3_kms_key.grant_decrypt(service_now_notifications_handler_role)
 
         # Grant specific DynamoDB permissions instead of full access
         table.grant_read_write_data(service_now_notifications_handler_role)
@@ -734,6 +748,9 @@ class AwsSecurityIncidentResponseServiceNowIntegrationStack(Stack):
 
         # Grant S3 permissions to read private key
         private_key_bucket.grant_read(service_now_resource_setup_role)
+        
+        # Grant KMS permissions to decrypt S3 objects using specific key
+        s3_kms_key.grant_decrypt(service_now_resource_setup_role)
 
         # Add suppression for wildcard resource in SSM and Secrets Manager policies
         NagSuppressions.add_resource_suppressions(
